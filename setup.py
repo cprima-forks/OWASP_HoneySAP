@@ -117,5 +117,7 @@ setup(name=read_metadata("__title__"),  # Package information
 
       # Optional requirements for docs
       extras_require={"tests": open('requirements-test.txt').read().splitlines(),
-                      "docs": open('requirements-docs.txt').read().splitlines()}
+                      "docs": open('requirements-docs.txt').read().splitlines(),
+                      # LOCAL PATCH (not upstream): profile option bapi_fixtures
+                      "bapi": ["cpmf-bapi-fixtures>=0.1.0a1"]}
       )
