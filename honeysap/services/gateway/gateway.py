@@ -341,7 +341,9 @@ def _build_dfies_rows(fields, nuc_mode=False):
         f2["intlen"] = intlen_wire  # value written into binary DFIES row
         f2["offset"] = offset       # cumulative offset in same units
         rows.append(_build_dfies_row(f2))
-        offset += intlen_wire
+        # LOCAL PATCH (not upstream): in NUC mode keep the running offset in UC bytes, because the
+        # table rows sent by _send_bapilist_response are laid out in UTF-16.
+        offset += intlen_uc if nuc_mode else intlen_wire
     return rows
 
 
@@ -1723,6 +1725,21 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                     if target:
                         data["target_function"] = target
                     self._send_rfcgfi_response(raw, target)
+                elif func_module == "RFC_FUNCTION_SEARCH" and \
+                        "RFC_METADATA_GET".encode("utf-16-le") in bytes(raw):
+                    # LOCAL PATCH (not upstream): NCo calls RFC_FUNCTION_SEARCH(FUNCNAME=RFC_METADATA_GET) to
+                    # decide whether to use the round-trip metadata call.  Any failure of that call makes NCo
+                    # fall back to RFC_GET_FUNCTION_INTERFACE + DDIF_FIELDINFO_GET.  Close without answering.
+                    self.logger.warning("PATCH: failing RFC_FUNCTION_SEARCH(RFC_METADATA_GET) so NCo uses the classic metadata calls")
+                    self.request.close()
+                    return
+                elif func_module == "BAPI_MONITOR_GETLIST":
+                    # LOCAL PATCH (not upstream): return predefined BAPILIST rows.
+                    self._send_bapilist_response(raw)
+                elif (fixture_outputs := self._load_fixture_results().get(func_module)) is not None:
+                    # LOCAL PATCH (not upstream): canned scalar outputs for this function module
+                    # (fixture file read once per call).
+                    self._send_fixture_response(raw, func_module, fixture_outputs)
                 elif func_module == "RFC_SYSTEM_INFO":
                     self._send_sysinfo_response(raw)
                 elif func_module == "DDIF_FIELDINFO_GET":
@@ -2573,6 +2590,120 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
             header = self._build_appc_header(raw, len(body))
             self.request.send(Raw(header + body))
 
+    def _load_fixture_results(self):
+        """LOCAL PATCH (not upstream): canned scalar outputs per function module.
+
+        File named by the profile option ``results_fixture``, columns BAPINAME;PARAMETER;VALUE, read on
+        every call so edits apply without a restart.  Returns {FUNCNAME: [(PARAMETER, VALUE), ...]}.
+        Option not set: feature off (empty result).  File set but unreadable: logged as an error and
+        treated as empty.
+        """
+        import csv as _csv
+        path = getattr(self.server, "results_fixture", None)
+        results = {}
+        if not path:
+            return results
+        try:
+            with open(path, newline="", encoding="utf-8") as fh:
+                for rec in _csv.DictReader(fh, delimiter=";"):
+                    name = (rec.get("BAPINAME") or "").strip()
+                    param = (rec.get("PARAMETER") or "").strip()
+                    if name and param:
+                        results.setdefault(name, []).append((param, rec.get("VALUE") or ""))
+        except OSError as exc:
+            self.logger.error("results_fixture %s cannot be read: %s", path, exc)
+        return results
+
+    def _send_fixture_response(self, raw, func_module, outputs):
+        """LOCAL PATCH (not upstream): answer a call with the canned CHAR outputs of its function.
+
+        *outputs* is the [(PARAMETER, VALUE), ...] list read once by the caller.  CHAR-LIKE
+        OUTPUTS ONLY: every value is sent as UTF-16 text, whatever the parameter's EXID.
+        Framing copied from _build_sysinfo_response_body: one 0x0201 name TLV and one 0x0203 value
+        TLV per output, then the program-name footer.  Text values are cut to, then padded with
+        blanks to, the length the RFM catalog declares (INTLENGTH is in UC bytes: 2 per char).
+        """
+        def utf16(s):
+            return s.encode("utf-16-le")
+
+        func_info = self.rfm_catalog.get(func_module) or {}
+        lengths = {p["parameter"]: max(1, int(p["intlength"]) // 2) for p in func_info.get("params", [])}
+
+        session_id = _extract_session_id(raw)
+        body = b"\x05\x00\x00\x00"
+        body += _tlv(0x0500, 0x0503, b"")
+        body += _tlv(0x0503, 0x0514, session_id)
+        body += _tlv(0x0514, 0x0420, b"\x00\x00\x00\x00")
+        body += _tlv(0x0420, 0x0512, b"")
+        prev = 0x0512
+        for param, value in outputs:
+            body += _tlv(prev, 0x0201, utf16(param))
+            width = lengths.get(param, len(value))
+            body += _tlv(0x0201, 0x0203, utf16(value[:width].ljust(width)))
+            prev = 0x0203
+        body += _tlv(prev, 0x0130, utf16("SAPLRFC1".ljust(40)))
+        body += _tlv(0x0130, 0x0667, b"\x00\x00\x00\x00\x40\x9d\xdf\x40")
+        body += _tlv(0x0667, 0xffff, b"") + b"\xff\xff"
+        self.logger.warning("PATCH: %s -> canned outputs %s", func_module, [p for p, _ in outputs])
+        if self._gw_connection:
+            self.request.send(Raw(self._build_gw_sap_send_hdr(raw) + body))
+        else:
+            header = self._build_appc_header(raw, len(body))
+            self.request.send(Raw(header + body))
+
+    def _send_bapilist_response(self, raw):
+        """LOCAL PATCH (not upstream): BAPI_MONITOR_GETLIST answer with predefined BAPILIST rows.
+
+        BAPIMONSTR FIXTURE SERIALIZER: the layout is fixed (ABAPNAME CHAR30 + BAPI_TEXT CHAR80 =
+        220 bytes of UTF-16), matching the BAPIMONSTR entry of ddic_catalog.  Rows come from the file
+        named by the profile option ``bapilist_fixture`` (columns ABAPNAME;BAPI_TEXT), read on every
+        call.  Option not set or file unreadable: logged as an error and an empty list is returned.
+        Table framing copied from _build_rfcgfi_body: table name, table index, (row_size,
+        row_count), then one 0x0303 TLV per row.
+        """
+        import csv as _csv
+
+        def utf16(s):
+            return s.encode("utf-16-le")
+
+        path = getattr(self.server, "bapilist_fixture", None)
+        rows = []
+        if not path:
+            self.logger.error("bapilist_fixture is not set in the profile: BAPI_MONITOR_GETLIST returns an empty list")
+        else:
+            try:
+                with open(path, newline="", encoding="utf-8") as fh:
+                    for rec in _csv.DictReader(fh, delimiter=";"):
+                        name = (rec.get("ABAPNAME") or "").strip()[:30].ljust(30)
+                        text = (rec.get("BAPI_TEXT") or "").strip()[:80].ljust(80)
+                        rows.append(utf16(name) + utf16(text))
+            except OSError as exc:
+                self.logger.error("bapilist_fixture %s cannot be read: %s", path, exc)
+        row_size = 220
+
+        session_id = _extract_session_id(raw)
+        body = b"\x05\x00\x00\x00"
+        body += _tlv(0x0500, 0x0503, b"")
+        body += _tlv(0x0503, 0x0514, session_id)
+        body += _tlv(0x0514, 0x0420, b"\x00\x00\x00\x00")
+        body += _tlv(0x0420, 0x0512, b"")
+        body += _tlv(0x0512, 0x0301, utf16("BAPILIST"))
+        body += _tlv(0x0301, 0x0330, struct.pack("!I", 1))
+        body += _tlv(0x0330, 0x0302, struct.pack("!II", row_size, len(rows)))
+        prev = 0x0302
+        for row in rows:
+            body += _tlv(prev, 0x0303, row)
+            prev = 0x0303
+        body += _tlv(prev, 0x0130, utf16("SAPLRFC1".ljust(40)))
+        body += _tlv(0x0130, 0x0667, b"\x00\x00\x00\x00\x40\x9d\xdf\x40")
+        body += _tlv(0x0667, 0xffff, b"") + b"\xff\xff"
+        self.logger.warning("PATCH: BAPI_MONITOR_GETLIST -> %d BAPILIST row(s) from %s", len(rows), path)
+        if self._gw_connection:
+            self.request.send(Raw(self._build_gw_sap_send_hdr(raw) + body))
+        else:
+            header = self._build_appc_header(raw, len(body))
+            self.request.send(Raw(header + body))
+
     def _send_sysinfo_response(self, raw):
         """Send RFC_SYSTEM_INFO response with system data."""
         session_id = _extract_session_id(raw)
@@ -3017,6 +3148,10 @@ class SAPGatewayService(BaseTCPService):
             self.server.ddic_catalog = load_ddic_catalog(ddic_path)
         else:
             self.server.ddic_catalog = {}
+
+        # LOCAL PATCH (not upstream): fixture files for BAPI_MONITOR_GETLIST and canned outputs.
+        self.server.bapilist_fixture = self.config.get("bapilist_fixture")
+        self.server.results_fixture = self.config.get("results_fixture")
 
         # Build tabname → INTLENGTH index from RFM catalog.
         # Used to synthesise CHAR-field DFIES descriptors for structure
